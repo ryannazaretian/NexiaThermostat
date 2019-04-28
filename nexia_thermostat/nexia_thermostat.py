@@ -2,7 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 
 import time
-
+import json
 
 class NexiaThermostat:
 
@@ -24,15 +24,15 @@ class NexiaThermostat:
         self.password = password
         self.house_id = house_id
 
+        self.session = requests.session()
+        self.session.max_redirects = 3
+        
         if auto_login:
             self.login()
 
-        self.session = requests.session()
-        self.session.max_redirects = 3
-
     def login(self):
         print("Logging in as " + self.username)
-        token = self.get_authenticity_token("/login")
+        token = self._get_authenticity_token("/login")
         if token:
             payload = {
                 'login': self.username,
@@ -41,32 +41,26 @@ class NexiaThermostat:
             }
             self.last_csrf = token['token']
             print("posting login")
-            r = self.post_url("/session", payload)
-            if r.status_code == 200:
-                return True
-
-            print("Failed to login", r.text)
-            return False
+            r = self._post_url("/session", payload)
+            self._check_response("Failed to login", r)
         else:
-            print("Failed to get csrf token")
-        return False
+            raise Exception("Failed to get csrf token")
 
-    def get_authenticity_token(self, url):
+    def _get_authenticity_token(self, url):
         print("getting auth token")
-        r = self.get_url(url)
-        if r.status_code == 200:
-            print("parsing csrf token")
-            soup = BeautifulSoup(r.text, 'html5lib')
-            param = soup.find("meta", attrs={'name': "csrf-param"})
-            token = soup.find("meta", attrs={'name': "csrf-token"})
-            if token and param:
-                return {
-                    "token": token['content'],
-                    "param": param['content']
-                }
-        return False
+        r = self._get_url(url)
+        self._check_response("Failed to get authenticity token", r)
+        print("parsing csrf token")
+        soup = BeautifulSoup(r.text, 'html5lib')
+        param = soup.find("meta", attrs={'name': "csrf-param"})
+        token = soup.find("meta", attrs={'name': "csrf-token"})
+        if token and param:
+            return {
+                "token": token['content'],
+                "param": param['content']
+            }
 
-    def put_url(self, url, payload):
+    def _put_url(self, url, payload):
         print("Starting PUT Request")
         request_url = self.ROOT_URL + url
 
@@ -86,16 +80,14 @@ class NexiaThermostat:
         if r.status_code == 302 and self.AUTH_FAILED_STRING in r.text:
             # assuming its redirecting to login
             time.sleep(1)
-            if not self.login():
-                return False
+            self.login()
             time.sleep(1)
-            return self.put_url(url, payload)
+            return self._put_url(url, payload)
 
-        if r.status_code == 200:
-            return r
-        return False
+        self._check_response("Failed PUT Request", r)
+        return r
 
-    def post_url(self, url, payload):
+    def _post_url(self, url, payload):
         request_url = self.ROOT_URL + url
         try:
             r = self.session.post(request_url, payload)
@@ -105,15 +97,13 @@ class NexiaThermostat:
 
         if r.status_code == 302 and self.AUTH_FAILED_STRING in r.text:
             # assuming its redirecting to login
-            if not self.login():
-                return False
-            return self.post_url(url, payload)
+            self.login()
+            return self._post_url(url, payload)
 
-        if r.status_code == 200:
-            return r
-        return False
+        self._check_response("Failed to POST url", r)
+        return r
 
-    def get_url(self, url):
+    def _get_url(self, url):
         request_url = self.ROOT_URL + url
 
         try:
@@ -124,72 +114,88 @@ class NexiaThermostat:
 
         if r.status_code == 302 and self.AUTH_FAILED_STRING in r.text:
             # assuming its redirecting to login
-            if not self.login():
-                return False
-            return self.get_url(url)
+            self.login()
+            return self._get_url(url)
 
-        if r.status_code == 200:
-            return r
-        return False
+        self._check_response("Failed to GET url", r)
+        return r
 
-    def get_zone_key(self, key, zone=0):
-        zone = self.get_zone(zone)
+    def _get_zone_key(self, key, zone_id=0):
+        zone = self._get_zone(zone_id)
         if not zone:
-            return False
+            raise KeyError("Zone {0} invalid.".format(zone_id))
 
         if key in zone:
             return zone[key]
+        raise KeyError("Zone {0} key \"{1}\" invalid.".format(zone_id, key))
 
-        return False
+    def print_all_zone_data(self, zone_id):
+        json = self._get_zone(zone_id)
+        for key in sorted(json.keys()):
+            print("{0}: {1}".format(key, json[key]))
 
-    def get_thermostat_key(self, key):
-        thermostat = self.get_thermostat_json()
+    def _get_thermostat_key(self, key):
+        thermostat = self._get_thermostat_json()
         if thermostat and key in thermostat:
             return thermostat[key]
-        return False
+        raise KeyError("Key \"{0}\" not in the thermostat JSON!".format(key))
 
-    def get_zone(self, zone=0):
-        thermostat = self.get_thermostat_json()
+    def _get_zone(self, zone_id=0):
+        thermostat = self._get_thermostat_json()
         if not thermostat:
             return None
-        if len(thermostat['zones']) > zone:
-            return thermostat['zones'][zone]
+        if len(thermostat['zones']) > zone_id:
+            return thermostat['zones'][zone_id]
         return None
 
-    def get_thermostat_json(self):
-        if not self.thermostat_json:
-            r = self.get_url("/houses/" + str(self.house_id) + "/xxl_thermostats")
+    def _get_thermostat_json(self):
+        if self.thermostat_json is None:
+            r = self._get_url("/houses/" + str(self.house_id) + "/xxl_thermostats")
             if r and r.status_code == 200:
-                ts = r.json()
-                if 0 in ts:
+                ts = json.loads(r.text)
+                if len(ts):
                     self.thermostat_json = ts[0]
+                else:
+                    raise Exception("Nothing in the JSON")
             else:
-                print("Failed to get thermostat JSON, session probably timed out")
-                print(r.status_code, r.headers)
-                return None
+                self._check_response("Failed to get thermostat JSON, session probably timed out", r)
         return self.thermostat_json
 
-    def get_zone_cooling_setpoint(self, zone=0):
-        return self.get_zone_key('cooling_setpoint', zone=zone)
+    def _check_response(self, description, r):
+        if r.status_code != 200:
+            raise Exception("{description}: \n"
+                            "  Code: {code}\n"
+                            "  Header: {header}\n"
+                            "  Text: {text}".format(description=description, code=r.status_code, header=r.header,
+                                                    text=r.text))
 
-    def get_zone_heating_setpoint(self, zone=0):
-        return self.get_zone_key('heating_setpoint', zone=zone)
+    def get_zone_cooling_setpoint(self, zone_id=0):
+        return self._get_zone_key('cooling_setpoint', zone_id=zone_id)
 
-    def get_zone_temperature(self, zone=0):
-        return self.get_zone_key('temperature', zone=zone)
+    def get_zone_heating_setpoint(self, zone_id=0):
+        return self._get_zone_key('heating_setpoint', zone_id=zone_id)
+
+    def get_zone_temperature(self, zone_id=0):
+        return self._get_zone_key('temperature', zone_id=zone_id)
 
     def get_fan_mode(self):
-        return self.get_thermostat_key('fan_mode')
+        return self._get_thermostat_key('fan_mode')
 
     def get_outdoor_temperature(self):
-        return self.get_thermostat_key('outdoor_temperature')
+        if self.has_outdoor_temperature():
+            return self._get_thermostat_key('outdoor_temperature')
+        else:
+            raise Exception("This system does not have an outdoor temperature sensor")
 
-    def get_setpoint_url(self, zone=0):
-        zone_id = self.get_zone_key('id', zone)
+    def has_outdoor_temperature(self):
+        return self._get_thermostat_key("have_odt")
+
+    def _get_setpoint_url(self, zone_id=0):
+        zone_id = self._get_zone_key('id', zone_id)
         return "/houses/" + str(self.house_id) + "/xxl_zones/" + str(zone_id) + "/setpoints"
 
-    def set_min_max_temp(self, min_temperature, max_temperature, zone=0):
-        url = self.get_setpoint_url(zone)
+    def set_min_max_temp(self, min_temperature, max_temperature, zone_id=0):
+        url = self._get_setpoint_url(zone_id)
 
         data = {
             'cooling_setpoint': max_temperature,
@@ -198,9 +204,63 @@ class NexiaThermostat:
             'heating_integer': min_temperature
         }
 
-        r = self.put_url(url, data)
+        r = self._put_url(url, data)
+        self._check_response("Could not set min/max temperature", r)
 
-        if r.status_code == 200:
-            return True
-        return False
+    def get_zone_ids(self):
+        return list(range(len(self._get_thermostat_key("zones"))))
+
+    def get_setpoint_limits(self):
+        return (self._get_thermostat_key("temperature_low_limit"), self._get_thermostat_key("temperature_high_limit"))
+
+    def get_deadband(self):
+        return self._get_thermostat_key("temperature_deadband")
+
+    def get_relative_humidity(self):
+        if self.has_relative_humidity():
+            return self._get_thermostat_key("current_relative_humidity")
+        else:
+            raise Exception("This system does not have a relative humidity sensor.")
+
+    def has_relative_humidity(self):
+        return self._get_thermostat_key("have_rh")
+
+    def print_all_json_data(self):
+        json = self._get_thermostat_json()
+        for key in sorted(json.keys()):
+            print("{0}: {1}".format(key, json[key]))
+
+    def get_compressor_speed(self):
+        if self.has_variable_speed_compressor():
+            return self._get_thermostat_key("compressor_speed")
+        else:
+            raise Exception("This system does not have a variable speed compressor.")
+
+    def has_variable_speed_compressor(self):
+        return self._get_thermostat_key("has_variable_speed_compressor")
+
+    def get_variable_fan_speed_limits(self):
+        if self.has_variable_fan_speed:
+            return (self._get_thermostat_key("min_fan_speed"), self._get_thermostat_key("max_fan_speed"))
+
+    def get_fan_speed(self):
+        if self.has_variable_fan_speed():
+            return self._get_thermostat_key("fan_speed")
+        else:
+            return 1.0 if self.is_blower_active() else 0.0
+
+    def is_blower_active(self):
+        return self._get_thermostat_key("blower_active")
+
+    def has_emergency_heat(self):
+        return self._get_thermostat_key("emergency_heat_supported")
+
+    def is_emergency_heat_active(self):
+        if self.has_emergency_heat():
+            return self._get_thermostat_key("emergency_heat_active")
+        else:
+            raise Exception("This system does not support emergency heat")
+
+    def has_variable_fan_speed(self):
+        return self._get_thermostat_key("fan_type") == "VSPD"
 
